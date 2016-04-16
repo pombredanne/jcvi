@@ -146,13 +146,8 @@ class FileSplitter (object):
         self.outputdir = outputdir
         self.mode = mode
 
-        self.format = format
+        format = format or self._guess_format(filename)
         logging.debug("format is %s" % format)
-
-        guessedformat = self._guess_format(filename)
-        if format != guessedformat:
-            logging.warn("warn: format guessed from suffix - {0}"\
-                          .format(guessedformat))
 
         if format in ("fasta", "fastq"):
             self.klass = "seqio"
@@ -161,6 +156,7 @@ class FileSplitter (object):
         else:
             self.klass = "txt"
 
+        self.format = format
         mkdir(outputdir)
 
     def _open(self, filename):
@@ -336,6 +332,10 @@ def must_open(filename, mode="r", checkexists=False, skipcheck=False, \
             import fileinput
             return fileinput.input(filename)
 
+    if filename.startswith("s3://"):
+        from jcvi.utils.aws import pull_from_s3
+        filename = pull_from_s3(filename)
+
     if filename in ("-", "stdin"):
         assert "r" in mode
         fp = sys.stdin
@@ -454,7 +454,13 @@ def read_block(handle, signal):
         key=lambda row: row.strip()[:signal_len] == signal))
     found_signal = False
     for header in it:
-        header = header.next().strip()
+        header = list(header)
+        for h in header[:-1]:
+            h = h.strip()
+            if h[:signal_len] != signal:
+                continue
+            yield h, []  # Header only, no contents
+        header = header[-1].strip()
         if header[:signal_len] != signal:
             continue
         found_signal = True
@@ -792,8 +798,7 @@ def split(args):
             help="split all records [default: %default]")
     p.add_option("--mode", default="optimal", choices=mode_choices,
             help="Mode when splitting records [default: %default]")
-    p.add_option("--format", default="fasta",
-            choices=("fasta", "fastq", "txt", "clust"),
+    p.add_option("--format", choices=("fasta", "fastq", "txt", "clust"),
             help="input file format [default: %default]")
 
     opts, args = p.parse_args(args)
@@ -987,6 +992,8 @@ def setop(args):
 
     Please quote the argument to avoid shell interpreting | and &.
     """
+    from jcvi.utils.natsort import natsorted
+
     p = OptionParser(setop.__doc__)
     p.add_option("--column", default=0, type="int",
                  help="The column to extract, 0-based, -1 to disable [default: %default]")
@@ -1012,7 +1019,7 @@ def setop(args):
     elif op == '^':
         t = fa ^ fb
 
-    for x in sorted(t):
+    for x in natsorted(t):
         print x
 
 

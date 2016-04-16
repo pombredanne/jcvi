@@ -859,6 +859,8 @@ def split(args):
     p = OptionParser(split.__doc__)
     p.add_option("--chunk", default=4, type="int",
                  help="Split chunks of at least N markers")
+    p.add_option("--splitsingle", default=False, action="store_true",
+                 help="Split breakpoint range right in the middle")
     opts, args = p.parse_args(args)
 
     if len(args) != 1:
@@ -866,7 +868,9 @@ def split(args):
 
     inputbed, = args
     bonus = 2
-    penalty = -(opts.chunk * bonus - 1)
+    nchunk = opts.chunk
+    nbreaks = 0
+    penalty = -(nchunk * bonus - 1)
     bed = Bed(inputbed)
     for seqid, bb in bed.sub_beds():
         markers = [Marker(x) for x in bb]
@@ -876,8 +880,14 @@ def split(args):
                 continue
             assert mi.seqid == mj.seqid
             start, end = mi.pos, mj.pos
-            assert start < end
-            print "\t".join(str(x) for x in (mi.seqid, start, end))
+            if start > end:
+                start, end = end, start
+            if opts.splitsingle:
+                start = end = (start + end) / 2
+            print "\t".join(str(x) for x in (mi.seqid, start - 1, end))
+            nbreaks += 1
+    logging.debug("A total of {} breakpoints inferred (--chunk={})".\
+                    format(nbreaks, nchunk))
 
 
 def animation(args):
@@ -1021,6 +1031,12 @@ def estimategaps(args):
     reindex([outagpfile, "--inplace"])
 
 
+def filename_to_mapname(filename):
+    # Infer map name based on file name
+    mapname = op.basename(filename).split(".")[0]
+    return mapname.replace("-", "_").replace(":", "_")
+
+
 def merge(args):
     """
     %prog merge map1 map2 map3 ...
@@ -1049,7 +1065,7 @@ def merge(args):
     b = Bed()
     mapnames = set()
     for row in fp:
-        mapname = fp.filename().split(".")[0]
+        mapname = filename_to_mapname(fp.filename())
         mapnames.add(mapname)
         try:
             m = CSVMapLine(row, mapname=mapname)
@@ -1090,7 +1106,7 @@ def mergebed(args):
     b = Bed()
     mapnames = set()
     for row in fp:
-        mapname = fp.filename().split(".")[0]
+        mapname = filename_to_mapname(fp.filename())
         mapnames.add(mapname)
         try:
             m = BedLine(row)
@@ -1174,8 +1190,11 @@ def path(args):
     p.add_option("--gapsize", default=100, type="int",
                  help="Insert gaps of size between scaffolds")
     p.add_option("--seqid", help="Only run partition with this seqid")
+    p.add_option("--partitions", help="Use predefined partitions of LGs")
     p.add_option("--links", default=10, type="int",
                  help="Only plot matchings more than")
+    p.add_option("--mincount", default=1, type="int",
+                 help="Minimum markers on a contig")
     p.add_option("--noplot", default=False, action="store_true",
                  help="Do not visualize the alignments")
     p.add_option("--skipconcorde", default=False, action="store_true",
@@ -1203,7 +1222,9 @@ def path(args):
     pf = inputbed.rsplit(".", 1)[0]
     bedfile = pf + ".bed"
     weightsfile = opts.weightsfile
+    partitionsfile = opts.partitions
     gapsize = opts.gapsize
+    mincount = opts.mincount
     skipconcorde = opts.skipconcorde
     ngen = opts.ngen
     npop = opts.npop
@@ -1234,28 +1255,34 @@ def path(args):
     for mlg in cc.mlgs:
         C.join(mlg)
 
-    logging.debug("Partition LGs based on {0}".format(ref))
-    for mapname in mapnames:
-        if mapname == ref:
-            continue
-        # Compute co-occurrence between LG pairs
-        G = defaultdict(int)
-        for s in allseqids:
-            s = Scaffold(s, cc)
-            s.add_LG_pairs(G, (ref, mapname))
-        # Convert edge list to adj list
-        nodes = defaultdict(list)
-        for (a, b), w in G.items():
-            nodes[a].append((b, w))
-        # Find the best ref LG every non-ref LG matches to
-        for n, neighbors in nodes.items():
-            if n.split("-")[0] == ref:
+    if partitionsfile:
+        logging.debug("Partition LGs based on `{}`".format(partitionsfile))
+        fp = open(partitionsfile)
+        for row in fp:
+            C.join(*row.strip().split(","))
+    else:
+        logging.debug("Partition LGs based on {0}".format(ref))
+        for mapname in mapnames:
+            if mapname == ref:
                 continue
-            neighbors = dict(neighbors)
-            best_neighbor, best_value = best_no_ambiguous(neighbors, n)
-            if best_neighbor is None:
-                continue
-            C.join(n, best_neighbor)
+            # Compute co-occurrence between LG pairs
+            G = defaultdict(int)
+            for s in allseqids:
+                s = Scaffold(s, cc)
+                s.add_LG_pairs(G, (ref, mapname))
+            # Convert edge list to adj list
+            nodes = defaultdict(list)
+            for (a, b), w in G.items():
+                nodes[a].append((b, w))
+            # Find the best ref LG every non-ref LG matches to
+            for n, neighbors in nodes.items():
+                if n.split("-")[0] == ref:
+                    continue
+                neighbors = dict(neighbors)
+                best_neighbor, best_value = best_no_ambiguous(neighbors, n)
+                if best_neighbor is None:
+                    continue
+                C.join(n, best_neighbor)
 
     partitions = defaultdict(list)
     # Partition the scaffolds and assign them to one consensus
@@ -1269,6 +1296,8 @@ def path(args):
             mw = weights[mapname]
             if consensus not in counts:
                 counts[consensus] = 0
+            if count < mincount:
+                continue
             counts[consensus] += count * mw
         best_consensus, best_value = best_no_ambiguous(counts, seqid)
         if best_consensus is None:

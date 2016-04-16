@@ -106,9 +106,54 @@ def main():
         ('blast', 'run blastn using query against reference'),
         ('blat', 'run blat using query against reference'),
         ('blasr', 'run blasr on a set of pacbio reads'),
+        ('nucmer', 'run nucmer using query against reference'),
+        ('last', 'run last using query against reference'),
             )
     p = ActionDispatcher(actions)
     p.dispatch(globals())
+
+
+def nucmer(args):
+    """
+    %prog nucmer ref.fasta query.fasta
+
+    Run NUCMER using query against reference. Parallel implementation derived
+    from: <https://github.com/fritzsedlazeck/sge_mummer>
+    """
+    from itertools import product
+
+    from jcvi.apps.grid import MakeManager
+    from jcvi.formats.base import split
+
+    p = OptionParser(nucmer.__doc__)
+    p.add_option("--chunks", type="int",
+                 help="Split both query and subject into chunks")
+    p.set_params(prog="nucmer", params="-g 5000 -l 24 -c 500")
+    p.set_cpus()
+    opts, args = p.parse_args(args)
+
+    if len(args) != 2:
+        sys.exit(not p.print_help())
+
+    ref, query = args
+    cpus = opts.cpus
+    nrefs = nqueries = opts.chunks or int(cpus ** .5)
+    refdir = ref.split(".")[0] + "-outdir"
+    querydir = query.split(".")[0] + "-outdir"
+    reflist = split([ref, refdir, str(nrefs)]).names
+    querylist = split([query, querydir, str(nqueries)]).names
+
+    mm = MakeManager()
+    for i, (r, q) in enumerate(product(reflist, querylist)):
+        pf = "{0:04d}".format(i)
+        cmd = "nucmer -maxmatch"
+        cmd += " {0}".format(opts.extra)
+        cmd += " {0} {1} -p {2}".format(r, q, pf)
+        deltafile = pf + ".delta"
+        mm.add((r, q), deltafile, cmd)
+        print cmd
+
+    mm.write()
 
 
 def blasr(args):
@@ -226,6 +271,74 @@ def blast(args):
                   hitlen=None, best=opts.best, task=opts.task, cpus=opts.cpus)
 
     return blastfile
+
+
+@depends
+def run_lastdb(infile=None, outfile=None, mask=False, lastdb_bin="lastdb"):
+    outfilebase = outfile.rsplit(".", 1)[0]
+    mask = "-c " if mask else ""
+    cmd = "{0} {1}{2} {3}".format(lastdb_bin, mask, outfilebase, infile)
+    sh(cmd)
+
+
+def last(args):
+    """
+    %prog database.fasta query.fasta
+
+    Run LAST by calling LASTDB and LASTAL. LAST program available:
+    <http://last.cbrc.jp>
+
+    Works with LAST-719.
+    """
+    p = OptionParser(last.__doc__)
+    p.add_option("--path", help="Specify LAST path")
+    p.add_option("--mask", default=False, action="store_true", help="Invoke -c in lastdb")
+    p.add_option("--format", default="BlastTab",
+                 choices=("TAB", "MAF", "BlastTab", "BlastTab+"),
+                 help="Output format")
+    p.add_option("--minlen", default=0, type="int",
+                 help="Filter alignments by how many bases match")
+    p.add_option("--minid", default=0, type="int", help="Minimum sequence identity")
+    p.set_cpus()
+    p.set_params()
+
+    opts, args = p.parse_args(args)
+
+    if len(args) != 2:
+        sys.exit(not p.print_help())
+
+    subject, query = args
+    path = opts.path
+    cpus = opts.cpus
+    getpath = lambda x: op.join(path, x) if path else x
+    lastdb_bin = getpath("lastdb")
+    lastal_bin = getpath("lastal")
+
+    subjectdb = subject.rsplit(".", 1)[0]
+    run_lastdb(infile=subject, outfile=subjectdb + ".prj", mask=opts.mask, \
+              lastdb_bin=lastdb_bin)
+
+    u = 2 if opts.mask else 0
+    cmd = "{0} -u {1}".format(lastal_bin, u)
+    cmd += " -P {0} -i3G".format(cpus)
+    cmd += " -f {0}".format(opts.format)
+    cmd += " {0} {1}".format(subjectdb, query)
+
+    minlen = opts.minlen
+    minid = opts.minid
+    extra = opts.extra
+    assert minid != 100, "Perfect match not yet supported"
+    mm = minid / (100 - minid)
+
+    if minlen:
+        extra += " -e{0}".format(minlen)
+    if minid:
+        extra += " -r1 -q{0} -a{0} -b{0}".format(mm)
+    if extra:
+        cmd += " " + extra.strip()
+
+    lastfile = get_outfile(subject, query, suffix="last")
+    sh(cmd, outfile=lastfile)
 
 
 if __name__ == '__main__':

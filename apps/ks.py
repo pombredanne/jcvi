@@ -16,15 +16,15 @@ import numpy as np
 from math import log, sqrt, pi, exp
 from itertools import product, combinations
 from functools import partial
-from collections import namedtuple
 
 from Bio import SeqIO
 from Bio import AlignIO
 from Bio.Align.Applications import ClustalwCommandline, MuscleCommandline
 
-from jcvi.formats.base import must_open
+from jcvi.formats.base import LineFile, must_open
 from jcvi.graphics.base import plt, savefig, AbstractLayout, markup
 from jcvi.utils.table import write_csv
+from jcvi.utils.cbook import gene_name
 from jcvi.apps.base import OptionParser, ActionDispatcher, mkdir, sh, \
             Popen, getpath, iglob
 
@@ -75,6 +75,7 @@ class MrTransCommandline(AbstractCommandline):
 def main():
 
     actions = (
+        ('batch', 'compute ks for a set of anchors file'),
         ('fromgroups', 'flatten the gene families into pairs'),
         ('prepare', 'prepare pairs of sequences'),
         ('calc', 'calculate Ks between pairs of sequences'),
@@ -85,6 +86,41 @@ def main():
             )
     p = ActionDispatcher(actions)
     p.dispatch(globals())
+
+
+def batch(args):
+    """
+    %prog batch all.cds *.anchors
+
+    Compute Ks values for a set of anchors file. This will generate a bunch of
+    work directories for each comparisons. The anchorsfile should be in the form
+    of specie1.species2.anchors.
+    """
+    from jcvi.apps.grid import MakeManager
+
+    p = OptionParser(batch.__doc__)
+    opts, args = p.parse_args(args)
+
+    if len(args) < 2:
+        sys.exit(not p.print_help())
+
+    cdsfile = args[0]
+    anchors = args[1:]
+    workdirs = [".".join(op.basename(x).split(".")[:2]) for x in anchors]
+    for wd in workdirs:
+        mkdir(wd)
+
+    mm = MakeManager()
+    for wd, ac in zip(workdirs, anchors):
+        pairscdsfile = wd + ".cds.fasta"
+        cmd = "python -m jcvi.apps.ks prepare {} {} -o {}".\
+                format(ac, cdsfile, pairscdsfile)
+        mm.add((ac, cdsfile), pairscdsfile, cmd)
+        ksfile = wd + ".ks"
+        cmd = "python -m jcvi.apps.ks calc {} -o {} --workdir {}".\
+                format(pairscdsfile, ksfile, wd)
+        mm.add(pairscdsfile, ksfile, cmd)
+    mm.write()
 
 
 class LayoutLine (object):
@@ -158,7 +194,7 @@ class KsPlot (object):
 
         self.labels = [markup(x) for x in self.labels]
 
-    def draw(self, title="*Ks* distribution"):
+    def draw(self, title="*Ks* distribution", filename="Ks_plot.pdf"):
 
         ax = self.ax
         ks_max = self.ks_max
@@ -166,7 +202,7 @@ class KsPlot (object):
         labels = self.labels
         legendp = self.legendp
         if len(lines) > 1:
-            leg = ax.legend(lines, labels, legendp,
+            leg = ax.legend(lines, labels, loc=legendp,
                             shadow=True, fancybox=True, prop={"size": 10})
             leg.get_frame().set_alpha(.5)
 
@@ -178,8 +214,7 @@ class KsPlot (object):
         ax.set_xticklabels(ax.get_xticks(), family='Helvetica')
         ax.set_yticklabels(ax.get_yticks(), family='Helvetica')
 
-        image_name = "Ks_plot.pdf"
-        savefig(image_name, dpi=300)
+        savefig(filename, dpi=300)
 
 
 def multireport(args):
@@ -199,6 +234,7 @@ def multireport(args):
     If color or marker is missing, then a random one will be assigned.
     """
     p = OptionParser(multireport.__doc__)
+    p.set_outfile(outfile="Ks_plot.pdf")
     add_plot_options(p)
     opts, args, iopts = p.set_image_options(args, figsize="5x5")
 
@@ -217,14 +253,14 @@ def multireport(args):
     ax = fig.add_axes([.12, .1, .8, .8])
     kp = KsPlot(ax, ks_max, bins, legendp=opts.legendp)
     for lo in layout:
-        data = read_ks_file(lo.ksfile)
+        data = KsFile(lo.ksfile)
         data = [x.ng_ks for x in data]
         data = [x for x in data if ks_min <= x <= ks_max]
         kp.add_data(data, lo.components, label=lo.label, \
                     color=lo.color, marker=lo.marker,
                     fill=fill, fitted=opts.fit)
 
-    kp.draw(title=opts.title)
+    kp.draw(title=opts.title, filename=opts.outfile)
 
 
 def get_GC3(cdsfile):
@@ -293,12 +329,12 @@ def gc3(args):
         if plot:
             plot_GC3(GC3_2, cdsfile2, fill="lightgreen")
 
-    data = read_ks_file(ks_file)
+    data = KsFile(ks_file)
     noriginals = len(data)
 
     fw = must_open(outfile, "w")
     writer = csv.writer(fw)
-    writer.writerow(header.split(","))
+    writer.writerow(fields.split(","))
     nlines = 0
     cutoff = .75
     for d in data:
@@ -459,6 +495,7 @@ def calc(args):
                       "e.g. ESTs [default: %default]")
     p.add_option("--msa", default="clustalw", choices=("clustalw", "muscle"),
                  help="software used to align the proteins [default: %default]")
+    p.add_option("--workdir", default=os.getcwd(), help="Work directory")
     p.set_outfile()
 
     opts, args = p.parse_args(args)
@@ -472,8 +509,8 @@ def calc(args):
         sys.exit(not p.print_help())
 
     output_h = must_open(opts.outfile, "w")
-    print >> output_h, header
-    work_dir = "syn_analysis"
+    print >> output_h, fields
+    work_dir = op.join(opts.workdir, "syn_analysis")
     mkdir(work_dir)
 
     if not protein_file:
@@ -717,7 +754,7 @@ def subset(args):
     ksvals = {}
     for ksfile in ksfiles:
         ksvals.update(dict((line.name, line) for line in \
-                        read_ks_file(ksfile, strip_names=opts.strip_names)))
+                        KsFile(ksfile, strip_names=opts.strip_names)))
 
     fp = open(pairsfile)
     fw = must_open(outfile, "w")
@@ -741,10 +778,10 @@ def subset(args):
                 continue
         ksline = ksvals[name]
         if block:
-            print >>fw, "\t".join(str(x) for x in (a, b, ksline.ng_ks))
+            print >>fw, "\t".join(str(x) for x in (a, b, ksline.ks))
         else:
-            ksline = ksline._replace(name = ";".join((a, b)))
-            print >>fw, ",".join(map(str, ksline))
+            ksline.name = ";".join((a, b))
+            print >>fw, ksline
         i += 1
     fw.close()
 
@@ -753,7 +790,7 @@ def subset(args):
     return outfile
 
 
-header = fields = "name,yn_ks,yn_ka,ng_ks,ng_ka"
+fields = "name,yn_ks,yn_ka,ng_ks,ng_ka"
 descriptions = {
         'name': 'Gene pair',
         'yn_ks': 'Yang-Nielson Ks estimate',
@@ -761,34 +798,59 @@ descriptions = {
         'ng_ks': 'Nei-Gojobori Ks estimate',
         'ng_ka': 'Nei-Gojobori Ka estimate'}
 
-KsLine = namedtuple("KsLine", fields)
+
+class KsLine:
+
+    def __init__(self, row, strip_names=False):
+        args = row.strip().split(",")
+        self.name = args[0]
+        self.yn_ks = self.get_float(args[1])
+        self.yn_ka = self.get_float(args[2])
+        self.ng_ks = self.get_float(args[3])
+        self.ng_ka = self.get_float(args[4])
+        self.ks = self.ng_ks
+        if ";" in self.name:
+            self.gene_a, self.gene_b = self.name.split(";")
+        if strip_names:
+            self.gene_a = gene_name(self.gene_a)
+            self.gene_b = gene_name(self.gene_b)
+
+    def get_float(self, x):
+        try:
+            x = float(x)
+        except:
+            x = -1
+        return x
+
+    def __str__(self):
+        return ",".join(str(x) for x in (self.name, self.yn_ks, self.yn_ka,
+                         self.ng_ks, self.ng_ka))
+
+    @property
+    def anchorline(self):
+        return "\t".join((self.gene_a, self.gene_b, "{:.3f}".format(self.ks)))
 
 
-def read_ks_file(ks_file, strip_names=False):
-    from jcvi.utils.cbook import gene_name
+class KsFile(LineFile):
 
-    reader = csv.reader(open(ks_file, "rb"))
-    data = []
-    for row in reader:
-        if row[0] == "name":  # header
-            continue
+    def __init__(self, filename, strip_names=False):
+        super(KsFile, self).__init__(filename)
 
-        for i, a in enumerate(row):
-            if i == 0:
-                if strip_names:
-                    row[i] = ";".join(gene_name(x) for x in row[i].split(";"))
+        fp = open(filename)
+        for row in fp:
+            ksline = KsLine(row, strip_names=strip_names)
+            if ksline.name == "name":  # header
                 continue
-            try:
-                row[i] = float(row[i])
-            except:
-                row[i] = -1
+            self.append(ksline)
 
-        data.append(KsLine._make(row))
+        logging.debug('File `{0}` contains a total of {1} gene pairs'.\
+                format(filename, len(self)))
 
-    logging.debug('File `{0}` contains a total of {1} gene pairs'.\
-            format(ks_file, len(data)))
-
-    return data
+    def print_to_anchors(self, outfile):
+        fw = must_open(outfile, "w")
+        for row in self:
+            print >> fw, row.anchorline
+        fw.close()
 
 
 def my_hist(ax, l, interval, max_r, color='g', marker='.', fill=False):
@@ -932,7 +994,7 @@ def report(args):
         sys.exit(not p.print_help())
 
     ks_file, = args
-    data = read_ks_file(ks_file)
+    data = KsFile(ks_file)
     ks_min = opts.vmin
     ks_max = opts.vmax
     bins = opts.bins

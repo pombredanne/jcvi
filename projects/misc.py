@@ -28,13 +28,56 @@ def main():
         ('amborella', 'plot amborella macro- and micro-synteny (requires data)'),
         # Mt4.0 paper (Tang et al., 2014 BMC Genomics)
         ('mtdotplots', 'plot Mt3.5 and Mt4.0 side-by-side'),
-        # Unpublished
-        ('litchi', 'plot litchi micro-synteny (requires data)'),
-        ('birch', 'plot birch macro-synteny (requires data)'),
+        # Oropetium paper (Vanburen et al., 2015 Nature)
         ('oropetium', 'plot oropetium micro-synteny (requires data)'),
+        # Unpublished
+        ('birch', 'plot birch macro-synteny (requires data)'),
+        ('litchi', 'plot litchi micro-synteny (requires data)'),
+        ('utricularia', 'plot utricularia micro-synteny (requires data)'),
             )
     p = ActionDispatcher(actions)
     p.dispatch(globals())
+
+
+def utricularia(args):
+    from jcvi.graphics.synteny import main as synteny_main
+
+    p = OptionParser(synteny_main.__doc__)
+    p.add_option("--switch",
+                 help="Rename the seqid with two-column file")
+    opts, args, iopts = p.set_image_options(args, figsize="8x7")
+
+    if len(args) != 3:
+        sys.exit(not p.print_help())
+
+    datafile, bedfile, layoutfile = args
+    switch = opts.switch
+
+    pf = datafile.rsplit(".", 1)[0]
+    fig = plt.figure(1, (iopts.w, iopts.h))
+    root = fig.add_axes([0, 0, 1, 1])
+
+    s = Synteny(fig, root, datafile, bedfile, layoutfile, loc_label=False, switch=switch)
+    light = "lightslategrey"
+    RoundRect(root, (.02, .69), .96, .24, fill=False, lw=2, ec=light)
+    RoundRect(root, (.02, .09), .96, .48, fill=False, lw=2, ec=light)
+    za, zb = s.layout[1].ratio, s.layout[-1].ratio  # zoom level
+    if za != 1:
+        root.text(.96, .89, "{}x zoom".format(za).replace(".0x", "x"),
+                  color=light, ha="right", va="center", size=14)
+    if zb != 1:
+        root.text(.96, .12, "{}x zoom".format(zb).replace(".0x", "x"),
+                  color=light, ha="right", va="center", size=14)
+
+    # legend showing the orientation of the genes
+    draw_gene_legend(root, .22, .3, .64, text=True)
+
+    root.set_xlim(0, 1)
+    root.set_ylim(0, 1)
+    root.set_axis_off()
+
+    image_name = pf + "." + iopts.format
+    savefig(image_name, dpi=iopts.dpi, iopts=iopts)
 
 
 def join_nodes(root, coords, a, b, x, slope=2.4,

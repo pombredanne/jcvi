@@ -10,13 +10,81 @@ import logging
 
 from string import maketrans
 from itertools import groupby, combinations
+from collections import defaultdict
 
 from jcvi.formats.blast import BlastSlow, Blast
 from jcvi.formats.sizes import Sizes
+from jcvi.formats.base import LineFile, must_open
 from jcvi.utils.iter import pairwise
 from jcvi.utils.range import range_intersect
-from jcvi.algorithms.graph import BiGraph, BiEdge
+from jcvi.algorithms.graph import BiGraph
 from jcvi.apps.base import OptionParser, ActionDispatcher
+
+
+class OVLLine:
+
+    def __init__(self, row):
+        # tig00000004     tig00042923     I       -64039  -18713  16592   99.84
+        # See also: assembly.goldenpath.Overlap for another implementation
+        args = row.split()
+        self.a = args[0]
+        self.b = args[1]
+        self.bstrand = '+' if args[2] == 'N' else '-'
+        self.ahang = int(args[3])
+        self.bhang = int(args[4])
+        self.overlap = int(args[5])
+        self.pctid = float(args[6])
+        self.score = int(self.overlap * self.pctid / 100)
+        self.best = None
+
+    @property
+    def tag(self):
+        if self.ahang >= 0:
+            t = "a->b" if self.bhang > 0 else "b in a"
+        elif self.ahang < 0:
+            t = "b->a" if self.bhang < 0 else "a in b"
+        return t
+
+
+class OVL (LineFile):
+
+    def __init__(self, filename):
+        super(OVL, self).__init__(filename)
+        fp = must_open(filename)
+        contained = set()
+        alledges = defaultdict(list)
+        for row in fp:
+            o = OVLLine(row)
+            self.append(o)
+            if o.tag == "a in b":
+                contained.add(o.a)
+            elif o.tag == "b in a":
+                contained.add(o.b)
+            if o.tag == "a->b":
+                alledges[o.a + "-3`"].append(o)
+            elif o.tag == "b->a":
+                alledges[o.a + "-5`"].append(o)
+        logging.debug("Imported {} links. Contained tigs: {}".\
+                        format(len(self), len(contained)))
+        self.contained = contained
+
+        logging.debug("Pruning edges to keep the mutual best")
+        for k, v in alledges.items():
+            bo = max(v, key=lambda x: x.score)
+            bo.best = True
+
+        self.graph = BiGraph()
+        for o in self:
+            if not o.best:
+                continue
+            if o.tag == "a->b":
+                a, b = o.a, o.b
+            elif o.tag == "b->a":
+                a, b = o.b, o.a
+            if a in contained or b in contained:
+                continue
+            bstrand = '<' if o.bstrand == '-' else '>'
+            self.graph.add_edge(a, b, '>', bstrand, length=o.score)
 
 
 def main():
@@ -24,6 +92,7 @@ def main():
     actions = (
         ("bed", "convert ANCHORS file to BED format"),
         ('fromblast', 'Generate path from BLAST file'),
+        ('fromovl', 'build overlap graph from AMOS overlaps'),
         ('happy', 'Make graph from happy mapping data'),
         ('partition', 'Make individual graphs partitioned by happy mapping'),
         ('merge', 'Merge multiple graphs together and visualize'),
@@ -31,6 +100,28 @@ def main():
             )
     p = ActionDispatcher(actions)
     p.dispatch(globals())
+
+
+def fromovl(args):
+    """
+    %prog graph nucmer2ovl.ovl fastafile
+
+    Build overlap graph from ovl file which is converted using NUCMER2OVL.
+    """
+    p = OptionParser(fromovl.__doc__)
+    opts, args = p.parse_args(args)
+
+    if len(args) != 2:
+        sys.exit(not p.print_help())
+
+    ovlfile, fastafile = args
+    ovl = OVL(ovlfile)
+    g = ovl.graph
+
+    fw = open("contained.ids", "w")
+    print >> fw, "\n".join(sorted(ovl.contained))
+
+    graph_to_agp(g, ovlfile, fastafile, exclude=ovl.contained, verbose=False)
 
 
 def bed(args):
@@ -121,8 +212,7 @@ def happy_edges(row, prefix=None):
             a = prefix + a
             b = prefix + b
 
-        e = BiEdge(a, b, oa, ob)
-        yield e, is_uncertain
+        yield (a, b, oa, ob), is_uncertain
 
 
 def partition(args):
@@ -155,10 +245,9 @@ def partition(args):
         edges = happy_edges(row, prefix=prefix)
 
         small_graph = BiGraph()
-        for e, is_uncertain in edges:
-            if is_uncertain:
-                e.color = "gray"
-            small_graph.add_edge(e)
+        for (a, b, oa, ob), is_uncertain in edges:
+            color = "gray" if is_uncertain else "black"
+            small_graph.add_edge(a, b, oa, ob, color=color)
 
         for (u, v), e in bg.edges.items():
             # Grab edge if both vertices are on the same line
@@ -299,12 +388,12 @@ def fromblast(args):
 
             atag = ">" if a.orientation == "+" else "<"
             btag = ">" if b.orientation == "+" else "<"
-            g.add_edge(BiEdge(asub, bsub, atag, btag))
+            g.add_edge(asub, bsub, atag, btag)
 
     graph_to_agp(g, blastfile, subjectfasta, verbose=opts.verbose)
 
 
-def graph_to_agp(g, blastfile, subjectfasta, verbose=False):
+def graph_to_agp(g, blastfile, subjectfasta, exclude=[], verbose=False):
 
     from jcvi.formats.agp import order_to_agp
 
@@ -339,16 +428,21 @@ def graph_to_agp(g, blastfile, subjectfasta, verbose=False):
         order_to_agp(object, ctgorder, sizes.mapping, fwagp)
 
     # Get the singletons as well
-    nsingletons = 0
+    nsingletons = nscaffolded = nexcluded = 0
     for ctg, size in sizes.iter_sizes():
         if ctg in scaffolded:
+            nscaffolded += 1
+            continue
+        if ctg in exclude:
+            nexcluded += 1
             continue
 
         ctgorder = [(ctg, "+")]
         object = ctg
         order_to_agp(object, ctgorder, sizes.mapping, fwagp)
         nsingletons += 1
-    logging.debug("Written {0} unscaffolded singletons.".format(nsingletons))
+    logging.debug("scaffolded={} excluded={} singletons={}".\
+                    format(nscaffolded, nexcluded, nsingletons))
 
     fwagp.close()
     logging.debug("AGP file written to `{0}`.".format(agpfile))
@@ -416,9 +510,7 @@ def connect(args):
             bsub = b.subject
             atag = ">" if a.orientation == "+" else "<"
             btag = ">" if b.orientation == "+" else "<"
-            e = BiEdge(asub, bsub, atag, btag)
-            g.add_edge(e)
-            print "=" * 5, e
+            g.add_edge(asub, bsub, atag, btag)
 
     graph_to_agp(g, blastfile, fastafile, verbose=False)
 

@@ -5,25 +5,374 @@
 Variant call format.
 """
 
+import os.path as op
 import sys
 import logging
 
 from collections import defaultdict
+from itertools import groupby
+from pyfaidx import Fasta
+from pyliftover import LiftOver
 
+from jcvi.formats.base import must_open
 from jcvi.formats.sizes import Sizes
 from jcvi.apps.base import OptionParser, ActionDispatcher, need_update, sh
+
+
+class VcfLine:
+
+    def __init__(self, row):
+        args = row.strip().split("\t")
+        self.seqid = args[0]
+        self.pos = int(args[1])
+        self.rsid = args[2]
+        self.ref = args[3]
+        self.alt = args[4]
+        self.qual = args[5]
+        self.filter = args[6]
+        self.info = args[7]
+        self.format = args[8]
+        self.genotype = args[9]
+
+    def __str__(self):
+        return "\t".join(str(x) for x in (
+            self.seqid, self.pos, self.rsid, self.ref,
+            self.alt, self.qual, self.filter, self.info,
+            self.format, self.genotype
+            ))
+
+
+class UniqueLiftover(object):
+
+    def __init__(self, chainfile):
+        """
+        This object will perform unique single positional liftovers - it will only lift over chromosome positions that
+        map unique to the new genome and if the strand hasn't changed.
+        Note: You should run a VCF Normalization sweep on all lifted ofer CPRAs to check for variants that need to be
+        re-normalized, and to remove variants where the REF now doesn't match after a liftover.
+        The combination of these steps will ensure high quality liftovers. However, it should be noted that this won't
+        prevent the situation where multiple positions in the old genome pile up uniquely in the new genome, so one
+        needs to check for this.
+        It's organised as an object rather than a collection of functions  so that the LiftOver chainfile
+        only gets opened/passed once and not for every position to be lifted over.
+        :param chainfile: A string containing the path to the local UCSC .gzipped chainfile
+        :return:
+        """
+
+        self.liftover = LiftOver(chainfile)
+
+    def liftover_cpra(self, chromosome, position, verbose=False):
+        """
+        Given chromosome, position in 1-based co-ordinates,
+        This will use pyliftover to liftover a CPRA, will return a (c,p) tuple or raise NonUniqueLiftover if no unique
+        and strand maintaining liftover is possible
+        :param chromosome: string with the chromosome as it's represented in the from_genome
+        :param position: position on chromosome (will be cast to int)
+        :return: ((str) chromosome, (int) position) or None if no liftover
+        """
+
+        chromosome = str(chromosome)
+        position = int(position)
+
+        # Perform the liftover lookup, shift the position by 1 as pyliftover deals in 0-based co-ords
+        new = self.liftover.convert_coordinate(chromosome, position - 1)
+        # This has to be here as new will be NoneType when the chromosome doesn't exist in the chainfile
+        if new:
+            # If the liftover is unique
+            if len(new) == 1:
+                # If the liftover hasn't changed strand
+                if new[0][2] == "+":
+                    # Set the co-ordinates to the lifted-over ones and write out
+                    new_chromosome = str(new[0][0])
+                    # Shift the position forward by one to convert back to a 1-based co-ords
+                    new_position = int(new[0][1]) + 1
+                    return new_chromosome, new_position
+                else:
+                    exception_string = "{},{} has a flipped strand in liftover: {}".format(chromosome, position, new)
+            else:
+                exception_string = "{},{} lifts over to multiple positions: {}".format(chromosome, position, new)
+        elif new is None:
+            exception_string = "Chromosome '{}' provided not in chain file".format(chromosome)
+
+        if verbose:
+            logging.error(exception_string)
+        return None, None
+
+
+CM = dict(zip([str(x) for x in range(1, 23)],
+          ["chr{0}".format(x) for x in range(1, 23)]) + \
+          [("X", "chrX"), ("Y", "chrY"), ("MT", "chrM")])
 
 
 def main():
 
     actions = (
+        ('from23andme', 'convert 23andme file to vcf file'),
+        ('fromimpute2', 'convert impute2 output to vcf file'),
+        ('liftover', 'lift over coordinates in vcf file'),
         ('location', 'given SNP locations characterize the locations'),
         ('mstmap', 'convert vcf format to mstmap input'),
-        ('summary', 'summarize the genotype calls in table'),
         ('refallele', 'make refAllele file'),
+        ('sample', 'sample subset of vcffile'),
+        ('summary', 'summarize the genotype calls in table'),
+        ('uniq', 'retain only the first entry in vcf file'),
             )
     p = ActionDispatcher(actions)
     p.dispatch(globals())
+
+
+def uniq(args):
+    """
+    %prog uniq vcffile
+
+    Retain only the first entry in vcf file.
+    """
+    from urlparse import parse_qs
+
+    p = OptionParser(uniq.__doc__)
+    opts, args = p.parse_args(args)
+
+    if len(args) != 1:
+        sys.exit(not p.print_help())
+
+    vcffile, = args
+    fp = must_open(vcffile)
+    data = []
+    for row in fp:
+        if row[0] == '#':
+            print row.strip()
+            continue
+        v = VcfLine(row)
+        data.append(v)
+
+    for pos, vv in groupby(data, lambda x: x.pos):
+        vv = list(vv)
+        if len(vv) == 1:
+            print vv[0]
+            continue
+        bestv = max(vv, key=lambda x: float(parse_qs(x.info)["R2"][0]))
+        print bestv
+
+
+def sample(args):
+    """
+    %prog sample vcffile 0.9
+
+    Sample subset of vcf file.
+    """
+    from random import random
+
+    p = OptionParser(sample.__doc__)
+    opts, args = p.parse_args(args)
+
+    if len(args) != 2:
+        sys.exit(not p.print_help())
+
+    vcffile, ratio = args
+    ratio = float(ratio)
+    fp = open(vcffile)
+    pf = vcffile.rsplit(".", 1)[0]
+    kept = pf + ".kept.vcf"
+    withheld = pf + ".withheld.vcf"
+    fwk = open(kept, "w")
+    fww = open(withheld, "w")
+    nkept = nwithheld = 0
+    for row in fp:
+        if row[0] == '#':
+            print >> fwk, row.strip()
+            continue
+        if random() < ratio:
+            nkept += 1
+            print >> fwk, row.strip()
+        else:
+            nwithheld += 1
+            print >> fww, row.strip()
+    logging.debug("{0} records kept to `{1}`".format(nkept, kept))
+    logging.debug("{0} records withheld to `{1}`".format(nwithheld, withheld))
+
+
+def get_vcfstanza(fastafile, fasta, sampleid="SAMP_001"):
+    from datetime import datetime as dt
+    # VCF spec
+    m = "##fileformat=VCFv4.1\n"
+    m += "##fileDate={0}{1:02d}{2:02d}\n".format(dt.now().year, dt.now().month, dt.now().day)
+    m += "##source={0}\n".format(__file__)
+    m += "##reference=file://{0}\n".format(op.abspath(fastafile).strip("/"))
+    m += '##INFO=<ID=PR,Number=0,Type=Flag,Description="Provisional genotype">\n'
+    m += '##INFO=<ID=IM,Number=0,Type=Flag,Description="Imputed genotype">\n'
+    m += '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+    m += '##FORMAT=<ID=GP,Number=3,Type=Float,Description="Estimated Genotype Probability">\n'
+    header = "CHROM POS ID REF ALT QUAL FILTER INFO FORMAT\n".split() + [sampleid]
+    m += "#" + "\t".join(header)
+    return m
+
+
+def fromimpute2(args):
+    """
+    %prog fromimpute2 impute2file fastafile 1
+
+    Convert impute2 output to vcf file. Imputed file looks like:
+
+    --- 1:10177:A:AC 10177 A AC 0.451 0.547 0.002
+    """
+    p = OptionParser(fromimpute2.__doc__)
+    opts, args = p.parse_args(args)
+
+    if len(args) != 3:
+        sys.exit(not p.print_help())
+
+    impute2file, fastafile, chr = args
+    fasta = Fasta(fastafile)
+    print get_vcfstanza(fastafile, fasta)
+    fp = open(impute2file)
+    seen = set()
+    for row in fp:
+        snp_id, rsid, pos, ref, alt, aa, ab, bb = row.split()
+        pos = int(pos)
+        if pos in seen:
+            continue
+        seen.add(pos)
+        code = max((float(aa), "0/0"), (float(ab), "0/1"), (float(bb), "1/1"))[-1]
+        tag = "PR" if snp_id == chr else "IM"
+        print "\t".join(str(x) for x in \
+                (chr, pos, rsid, ref, alt, ".", ".", tag, \
+                "GT:GP", code + ":" + ",".join((aa, ab, bb))))
+
+
+def read_rsid(seqid, legend):
+    if seqid in ["Y", "MT"]:
+        return {}
+    # Read rsid
+    fp = open(legend)
+    # rs145072688:10352:T:TA
+    register = {}
+    for row in fp:
+        atoms = row.strip().split(":")
+        if len(atoms) == 4:
+            rsid, pos, ref, alt = atoms
+        else:
+            continue
+        pos = int(pos)
+        # Use position for non-rsid
+        rsids = [pos] if rsid == seqid else [rsid, pos]
+        for rsid in rsids:
+            if rsid in register:
+                pos1, ref1, alt1 = register[rsid]
+                if alt not in alt1:
+                    register[rsid][-1].append(alt)
+            else:
+                register[rsid] = (pos, ref, [alt])
+    logging.debug("A total of {0} sites imported from `{1}`".\
+                    format(len(register), legend))
+    return register
+
+
+def from23andme(args):
+    """
+    %prog from23andme txtfile 1
+
+    Convert from23andme file to vcf file.
+
+    --ref points to the folder that contains chr1.rsids
+
+    $ zcat 1000GP_Phase3/1000GP_Phase3_chr1.legend.gz \\
+            | cut -d" " -f1 | grep ":" > chr1.rsids
+    """
+    p = OptionParser(from23andme.__doc__)
+    p.set_ref()
+    opts, args = p.parse_args(args)
+
+    if len(args) != 2:
+        sys.exit(not p.print_help())
+
+    txtfile, seqid = args
+    ref_dir = opts.ref
+    fastafile = op.join(ref_dir, "hs37d5.fa")
+    fasta = Fasta(fastafile)
+
+    pf = txtfile.rsplit(".", 1)[0]
+    px = CM[seqid]
+    chrvcf = pf + ".{0}.vcf".format(px)
+    legend = op.join(ref_dir, "1000GP_Phase3/{0}.rsids".format(px))
+    register = read_rsid(seqid, legend)
+
+    fw = open(chrvcf, "w")
+    print >> fw, get_vcfstanza(fastafile, fasta, txtfile)
+
+    fp = open(txtfile)
+    seen = set()
+    duplicates = skipped = missing = 0
+    for row in fp:
+        if row[0] == '#':
+            continue
+        rsid, chr, pos, genotype = row.split()
+        if chr != seqid:
+            continue
+        pos = int(pos)
+        if (chr, pos) in seen:
+            duplicates += 1
+            continue
+        seen.add((chr, pos))
+        genotype = list(genotype)
+        if "-" in genotype:  # missing daa
+            missing += 1
+            continue
+
+        # Y or MT
+        if not register:
+            assert len(genotype) == 1
+            ref = fasta[chr][pos - 1].seq.upper()
+            if "D" in genotype or "I" in genotype:
+                skipped += 1
+                continue
+            genotype = genotype[0]
+            code = "0/0" if ref == genotype else "1/1"
+            alt = "." if ref == genotype else genotype
+            print >> fw, "\t".join(str(x) for x in \
+                    (chr, pos, rsid, ref, alt, ".", ".", "PR", "GT", code))
+            continue
+
+        # If rsid is seen in the db, use that
+        if rsid in register:
+            pos, ref, alt = register[rsid]
+        elif pos in register:
+            pos, ref, alt = register[pos]
+        else:
+            skipped += 1  # Not in reference panel
+            continue
+
+        assert fasta[chr][pos - 1:pos + len(ref) - 1].seq.upper() == ref
+        # Keep it bi-allelic
+        not_seen = [x for x in alt if x not in genotype]
+        while len(alt) > 1 and not_seen:
+            alt.remove(not_seen.pop())
+        if len(alt) > 1:
+            alt = [alt[0]]
+        alleles = [ref] + alt
+
+        if len(genotype) == 1:
+            genotype = [genotype[0]] * 2
+
+        alt = ",".join(alt) or "."
+        if "D" in genotype or "I" in genotype:
+            max_allele = max((len(x), x) for x in alleles)[1]
+            alleles = [("I" if x == max_allele else "D") for x in alleles]
+            assert "I" in alleles and "D" in alleles
+        a, b = genotype
+        try:
+            ia, ib = alleles.index(a), alleles.index(b)
+        except ValueError:  # alleles not seen
+            logging.error("{0}: alleles={1}, genotype={2}".\
+                            format(rsid, alleles, genotype))
+            skipped += 1
+            continue
+        code = "/".join(str(x) for x in sorted((ia, ib)))
+
+        print >> fw, "\t".join(str(x) for x in \
+                (chr, pos, rsid, ref, alt, ".", ".", "PR", "GT", code))
+
+    logging.debug("duplicates={0} skipped={1} missing={2}".\
+                    format(duplicates, skipped, missing))
 
 
 def refallele(args):
@@ -316,6 +665,61 @@ def mstmap(args):
 
     mm = MSTMatrix(genotypes, mh, ptype, opts.missing_threshold)
     mm.write(opts.outfile, header=(not opts.noheader))
+
+
+def liftover(args):
+    """
+    %prog liftover old.vcf hg19ToHg38.over.chain.gz new.vcf
+
+    Lift over coordinates in vcf file.
+    """
+    p = OptionParser(liftover.__doc__)
+    p.add_option("--newid", default=False, action="store_true",
+                 help="Make new identifiers")
+    opts, args = p.parse_args(args)
+
+    if len(args) != 3:
+        sys.exit(not p.print_help())
+
+    oldvcf, chainfile, newvcf = args
+    ul = UniqueLiftover(chainfile)
+    num_excluded = 0
+    fp = open(oldvcf)
+    fw = open(newvcf, "w")
+    for row in fp:
+        row = row.strip()
+        if row[0] == '#':
+            if row.startswith("##source="):
+                row = "##source={0}".format(__file__)
+            elif row.startswith("##reference="):
+                row = "##reference=hg38"
+            elif row.startswith("##contig="):
+                continue
+            print >> fw, row.strip()
+            continue
+
+        v = VcfLine(row)
+        # GRCh37.p2 has the same MT sequence as hg38 (but hg19 is different)
+        if v.seqid == "MT":
+            v.seqid = "chrM"
+            print >> fw, v
+            continue
+
+        try:
+            new_chrom, new_pos = ul.liftover_cpra(CM[v.seqid], v.pos)
+        except:
+            num_excluded +=1
+            continue
+
+        if new_chrom != None and new_pos != None:
+            v.seqid, v.pos = new_chrom, new_pos
+            if opts.newid:
+                v.rsid = "{0}:{1}".format(new_chrom.replace("chr", ""), new_pos)
+            print >> fw, v
+        else:
+            num_excluded +=1
+
+    logging.debug("Excluded {0}".format(num_excluded))
 
 
 if __name__ == '__main__':

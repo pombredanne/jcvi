@@ -41,6 +41,7 @@ class Dependency (object):
             s = "{0} : {1}\n".format(target, source)
 
         for c in self.cmds:
+            c = c.replace("$", "$$")  # Command escaping
             s += "\t" + c + "\n"
         return s
 
@@ -69,11 +70,18 @@ class MakeManager (list):
         print >> fw, "all : {0}\n".format(" ".join(sorted(self.targets)))
         for d in self:
             print >> fw, d
+        print >> fw, "clean :\n\trm -f {0}\n".format(" ".join(self.targets))
         fw.close()
         logging.debug("Makefile written to `{0}`.".format(self.makefile))
 
     def run(self, cpus=1):
+        if not op.exists(self.makefile):
+            self.write()
         cmd = "make -j {0} -f {1}".format(cpus, self.makefile)
+        sh(cmd)
+
+    def clean(self):
+        cmd = "make clean -f {}".format(self.makefile)
         sh(cmd)
 
 
@@ -117,7 +125,7 @@ class WriteJobs (object):
         for a in args:
             workerq.put(a)
 
-        cpus = min(cpus, len(a))
+        cpus = min(cpus, len(args))
         for i in xrange(cpus):
             workerq.put(Poison())
 
@@ -293,8 +301,22 @@ class Grid (list):
             pi.start()
 
 
+PBS_STANZA = """
+#PBS -q standard
+#PBS -J 1-{0}
+#PBS -l select=1:ncpus={1}:mem=23gb
+#PBS -l pvmem=23gb
+#PBS -l walltime=100:00:00
+#PBS -W group_list=genomeanalytics
+"""
+
 arraysh = """
 CMD=`awk "NR==$SGE_TASK_ID" {0}`
+$CMD"""
+
+arraysh_ua = PBS_STANZA + """
+cd $PBS_O_WORKDIR
+CMD=`awk "NR==$PBS_ARRAY_INDEX" {2}`
 $CMD"""
 
 
@@ -331,7 +353,7 @@ def array(args):
 
     cmds, = args
     fp = open(cmds)
-    ncmds = sum(1 for x in fp)
+    N = sum(1 for x in fp)
     fp.close()
 
     pf = cmds.rsplit(".",  1)[0]
@@ -339,8 +361,14 @@ def array(args):
     assert runfile != cmds, \
             "Commands list file should not have a `.sh` extension"
 
-    contents = arraysh.format(cmds)
+    engine = get_grid_engine()
+    threaded = opts.threaded or 1
+    contents = arraysh.format(cmds) if engine == "SGE" \
+                else arraysh_ua.format(N, threaded, cmds)
     write_file(runfile, contents)
+
+    if engine == "PBS":
+        return
 
     outfile = "{0}.{1}.out".format(pf, "\$TASK_ID")
     errfile = "{0}.{1}.err".format(pf, "\$TASK_ID")

@@ -227,7 +227,17 @@ def thousands(x):
     '12,345'
     """
     import locale
-    locale.setlocale(locale.LC_ALL, "en_US.utf8")
+    try:
+        locale.setlocale(locale.LC_ALL, "en_US.utf8")
+    except Exception:
+        locale.setlocale(locale.LC_ALL, "en_US.UTF-8")
+    finally:
+        s = '%d' % x
+        groups = []
+        while s and s[-1].isdigit():
+            groups.append(s[-3:])
+            s = s[:-3]
+        return s + ','.join(reversed(groups))
     return locale.format('%d', x, True)
 
 

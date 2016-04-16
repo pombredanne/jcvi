@@ -9,8 +9,8 @@ import numpy as np
 from collections import defaultdict
 
 from jcvi.algorithms.lis import heaviest_increasing_subsequence as his
-from jcvi.formats.bed import Bed
-from jcvi.formats.blast import BlastLine
+from jcvi.formats.bed import Bed, BedLine
+from jcvi.formats.blast import Blast
 from jcvi.formats.base import BaseFile, SetFile, read_block, must_open
 from jcvi.utils.grouper import Grouper
 from jcvi.utils.cbook import gene_name, human_size
@@ -136,9 +136,17 @@ class BlockFile (BaseFile):
         self.ncols = ncols
 
     def get_extent(self, i, order, debug=True):
-        col = self.columns[i]
-        ocol = [order[x] for x in col if x in order]
-        orientation = '+' if ocol[0][0] <= ocol[-1][0] else '-'
+        # Some blocks file, such as ones manually edited, will have garbled
+        # order, which prompts the hack below
+        acol = [order[x][0] for x in self.columns[0] if x in order]
+        bcol = [order[x][0] for x in self.columns[i] if x in order]
+        elen = min(len(acol), len(bcol))
+        ia, ib = acol[:elen], bcol[:elen]
+        slope, intercept = np.polyfit(ia, ib, 1)
+        orientation = '+' if slope >= 0 else '-'
+
+        ocol = [order[x] for x in self.columns[i] if x in order]
+        #orientation = '+' if ocol[0][0] <= ocol[-1][0] else '-'
         si, start = min(ocol)
         ei, end = max(ocol)
         same_chr = (start.seqid == end.seqid)
@@ -256,11 +264,10 @@ def read_blast(blast_file, qorder, sorder, is_self=False, ostrip=True):
     """
     read the blast and convert name into coordinates
     """
-    fp = open(blast_file)
     filtered_blast = []
     seen = set()
-    for row in fp:
-        b = BlastLine(row)
+    bl = Blast(blast_file)
+    for b in bl:
         query, subject = b.query, b.subject
         if query == subject:
             continue
@@ -272,11 +279,14 @@ def read_blast(blast_file, qorder, sorder, is_self=False, ostrip=True):
         qi, q = qorder[query]
         si, s = sorder[subject]
 
-        if is_self and qi > si:
+        if is_self:
             # remove redundant a<->b to one side when doing self-self BLAST
-            query, subject = subject, query
-            qi, si = si, qi
-            q, s = s, q
+            if qi > si:
+                query, subject = subject, query
+                qi, si = si, qi
+                q, s = s, q
+            if si - qi < 10:  # Too close to diagonal! possible tandem repeats
+                continue
 
         key = query, subject
         if key in seen:
@@ -775,6 +785,8 @@ def simple(args):
                 help="Output additional columns [default: %default]")
     p.add_option("--coords", default=False, action="store_true",
                 help="Output columns with base coordinates [default: %default]")
+    p.add_option("--bed", default=False, action="store_true",
+                help="Generate BED file for the blocks")
     p.add_option("--noheader", default=False, action="store_true",
                 help="Don't output header [default: %default]")
     p.set_beds()
@@ -787,6 +799,10 @@ def simple(args):
     additional = opts.rich
     coords = opts.coords
     header = not opts.noheader
+    bed = opts.bed
+    if bed:
+        coords = True
+        bbed = Bed()
 
     ac = AnchorFile(anchorfile)
     simplefile = anchorfile.rsplit(".", 1)[0] + ".simple"
@@ -850,6 +866,12 @@ def simple(args):
             bargs = [block_id, bseqid, bstartbase, bendbase,
                      bbase, bstart, bend, bspan, orientation]
 
+            if bed:
+                bbed.append(BedLine("\t".join(str(x) for x in \
+                           (bseqid, bstartbase - 1, bendbase,
+                           "{}:{}-{}".format(aseqid, astartbase, aendbase),
+                           size, orientation))))
+
             for args in (aargs, bargs):
                 print >> fws, "\t".join(str(x) for x in args)
             continue
@@ -865,11 +887,16 @@ def simple(args):
 
     if coords:
         print >> sys.stderr, "Total block span in {0}: {1}".format(qbed.filename, \
-                        human_size(atotalbase, precision=0))
+                        human_size(atotalbase, precision=2))
         print >> sys.stderr, "Total block span in {0}: {1}".format(sbed.filename, \
-                        human_size(btotalbase, precision=0))
+                        human_size(btotalbase, precision=2))
         print >> sys.stderr, "Ratio: {0:.1f}x".format(\
                         max(atotalbase, btotalbase) * 1. / min(atotalbase, btotalbase))
+
+    if bed:
+        bedfile = simplefile + ".bed"
+        bbed.print_to_file(filename=bedfile, sorted=True)
+        logging.debug("Bed file written to `{}`".format(bedfile))
 
 
 def screen(args):

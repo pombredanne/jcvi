@@ -594,7 +594,7 @@ def ortholog(args):
     such predictions. Extra orthologs will be recruited from reciprocal best
     match (RBH).
     """
-    from jcvi.apps.last import main as last_main
+    from jcvi.apps.align import last as last_main
     from jcvi.compara.blastfilter import main as blastfilter_main
     from jcvi.compara.quota import main as quota_main
     from jcvi.compara.synteny import scan, mcscan, liftover
@@ -626,7 +626,7 @@ def ortholog(args):
     qprefix = ".".join((bprefix, aprefix))
     last = pprefix + ".last"
     if need_update((afasta, bfasta), last):
-        last_main([bfasta, afasta, "-o", last])
+        last_main([bfasta, afasta])
 
     if a == b:
         last = filter([last, "--hitlen=0", "--pctid=98", "--inverse", "--noself"])

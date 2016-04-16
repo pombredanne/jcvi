@@ -125,6 +125,8 @@ class Blast (BaseFile):
     def __iter__(self):
         self.fp.seek(0)
         for row in self.fp:
+            if row[0] == '#':
+                continue
             yield BlastLine(row)
 
     def iter_hits(self):
@@ -972,7 +974,9 @@ def covfilter(args):
             if b.pctid < pctid:
                 continue
 
-            this_covered += abs(start - stop + 1)
+            if start > stop:
+                start, stop = stop, start
+            this_covered += stop - start + 1
             this_alignlen += b.hitlen
             this_mismatches += b.nmismatch
             this_gaps += b.ngaps
@@ -1091,6 +1095,8 @@ def bed(args):
     Print out bed file based on coordinates in BLAST report. By default, write
     out subject positions. Use --swap to write query positions.
     """
+    from jcvi.formats.bed import sort as bed_sort
+
     p = OptionParser(bed.__doc__)
     p.add_option("--swap", default=False, action="store_true",
                  help="Write query positions [default: %default]")
@@ -1113,6 +1119,8 @@ def bed(args):
         print >> fw, b.bedline
 
     logging.debug("File written to `{0}`.".format(bedfile))
+    fw.close()
+    bed_sort([bedfile, "-i"])
 
     return bedfile
 

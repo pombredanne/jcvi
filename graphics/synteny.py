@@ -7,7 +7,7 @@
 Illustrate MCscan multiple collinearity alignments. Use layout.csv to indicate
 the positions of tracks. For example:
 
-#x, y, rotation, ha, va, color
+#x, y, rotation, ha, va, color, ratio
 0.5, 0.6, 0, left, center, g
 0.25, 0.7, 45, top, center, m
 
@@ -111,7 +111,8 @@ class Shade (object):
 class Region (object):
 
     def __init__(self, ax, ext, layout, bed, scale, switch=None,
-                 chr_label=True, pad=.04, vpad=.012, extra_features=None):
+                 chr_label=True, loc_label=True,
+                 pad=.04, vpad=.012, extra_features=None):
         x, y = layout.x, layout.y
         ratio = layout.ratio
         scale /= ratio
@@ -191,7 +192,7 @@ class Region (object):
         if va == "top":
             yy = y + cc * pad
         elif va == "bottom":
-            yy = y - cc * pad - .01
+            yy = y - cc * pad
         else:
             yy = y
 
@@ -199,14 +200,27 @@ class Region (object):
         trans_angle = ax.transAxes.transform_angles(np.array((lr, )),
                                                     l.reshape((1, 2)))[0]
         lx, ly = l
-        if not hidden and chr_label:
+        if not hidden:
             bbox = dict(boxstyle="round", fc='w', ec='w', alpha=.5)
-            ax.text(lx, ly + vpad, markup(chr), color=layout.color,
-                        ha=ha, va="center", rotation=trans_angle,
-                        bbox=bbox, zorder=10)
-            ax.text(lx, ly - vpad, label, color="lightslategrey", size=10,
-                        ha=ha, va="center", rotation=trans_angle,
-                        bbox=bbox, zorder=10)
+            kwargs = dict(ha=ha, va="center",
+                          rotation=trans_angle, bbox=bbox, zorder=10)
+
+            # TODO: I spent several hours on trying to make this work - with no
+            # good solutions. To generate labels on multiple lines, each line
+            # with a different style is difficult in matplotlib. The only way,
+            # if you can tolerate an extra dot (.), is to use the recipe below.
+            #chr_label = r"\noindent " + markup(chr) + r" \\ ." if chr_label else None
+            #loc_label = r"\noindent . \\ " + label if loc_label else None
+
+            chr_label = markup(chr) if chr_label else None
+            loc_label = label if loc_label else None
+            if chr_label:
+                if loc_label:
+                    ax.text(lx, ly + vpad, chr_label, color=layout.color, **kwargs)
+                    ax.text(lx, ly - vpad, loc_label, color="lightslategrey",
+                            size=10, **kwargs)
+                else:
+                    ax.text(lx, ly, chr_label, color=layout.color, **kwargs)
 
     def get_coordinates(self, gstart, gend, y, cv, tr, inv):
         x1, x2 = cv(gstart), cv(gend)
@@ -219,13 +233,13 @@ class Synteny (object):
 
     def __init__(self, fig, root, datafile, bedfile, layoutfile,
                  switch=None, tree=None, extra_features=None,
-                 chr_label=True, pad=.04):
+                 chr_label=True, loc_label=True, pad=.04):
 
         w, h = fig.get_figwidth(), fig.get_figheight()
         bed = Bed(bedfile)
         order = bed.order
         bf = BlockFile(datafile)
-        lo = Layout(layoutfile)
+        self.layout = lo = Layout(layoutfile)
         switch = DictFile(switch, delimiter="\t") if switch else None
         if extra_features:
             extra_features = Bed(extra_features)
@@ -257,7 +271,8 @@ class Synteny (object):
             ext = exts[i]
             ef = extras[i] if extras else None
             r = Region(root, ext, lo[i], bed, scale, switch,
-                       chr_label=chr_label, vpad=vpad, extra_features=ef)
+                       chr_label=chr_label, loc_label=loc_label,
+                       vpad=vpad, extra_features=ef)
             self.rr.append(r)
             # Use tid and accn to store gene positions
             gg.update(dict(((i, k), v) for k, v in r.gg.items()))
@@ -287,7 +302,7 @@ class Synteny (object):
             for i in xrange(ntrees):
                 ax = fig.add_axes([xstart, ystart, xiv, yiv])
                 label, outgroup, tx = trees[i]
-                draw_tree(ax, tx, outgroup=outgroup, rmargin=.4)
+                draw_tree(ax, tx, outgroup=outgroup, rmargin=.4, leaffont=11)
                 xstart += xiv
                 RoundLabel(ax, .5, .3, label, fill=True, fc="lavender", color="r")
 
@@ -298,13 +313,13 @@ def draw_gene_legend(ax, x1, x2, ytop, d=.04, text=False, repeat=False):
     ax.plot([x2, x2 + d], [ytop, ytop], ":", color=backward, lw=2)
     ax.plot([x2], [ytop], "<", color=backward, mec="g")
     if text:
-        ax.text(x1 + d / 2, ytop + d, "gene (+)", ha="center")
-        ax.text(x2 + d / 2, ytop + d, "gene (-)", ha="center")
+        ax.text(x1 + d / 2, ytop + d / 2, "gene (+)", ha="center")
+        ax.text(x2 + d / 2, ytop + d / 2, "gene (-)", ha="center")
     if repeat:
         xr = (x1 + x2 + d) / 2
         Glyph(ax, xr - d / 2, xr + d / 2, ytop, .012 * 3 / 4, gradient=False,
               fc='#ff7f00', zorder=2)
-        ax.text(xr, ytop + d, "repeat", ha="center")
+        ax.text(xr, ytop + d / 2, "repeat", ha="center")
 
 
 def main():

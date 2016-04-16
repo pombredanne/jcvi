@@ -171,14 +171,14 @@ class OptionParser (OptionP):
                              action="store_true", help="Cell alignment")
         self.add_option_group(group)
 
-    def set_params(self, dest=None):
+    def set_params(self, prog=None, params=""):
         """
         Add --params options for given command line programs
         """
-        dest_prog = "to {0}".format(dest) if dest else ""
-        self.add_option("--params", dest="extra", default="",
+        dest_prog = "to {0}".format(prog) if prog else ""
+        self.add_option("--params", dest="extra", default=params,
                 help="Extra parameters to pass {0}".format(dest_prog) + \
-                     " (these WILL NOT be validated) [default: %default]")
+                     " (these WILL NOT be validated)")
 
     def set_outfile(self, outfile="stdout"):
         """
@@ -237,6 +237,20 @@ class OptionParser (OptionP):
                     help="Password to connect to database [default: %default]")
         self.add_option("--port", type="int",
                 help="Specify port number [default: %default]")
+
+    def set_aws_opts(self, store="hli-mv-data-science/htang"):
+        from jcvi.utils.aws import s3ify
+        store = s3ify(store)
+        group = OptionGroup(self, "AWS and Docker options")
+        self.add_option_group(group)
+        # https://github.com/hlids/infrastructure/wiki/Docker-calling-convention
+        group.add_option("--sample_id", help="Sample ID")
+        group.add_option("--workflow_execution_id", help="Workflow execution ID")
+        group.add_option("--input_bam_path", help="Input BAM location (s3 ok)")
+        group.add_option("--output_path", default=store, help="Output s3 path")
+        group.add_option("--workdir", default=os.getcwd(), help="Specify work dir")
+        group.add_option("--nocleanup", default=False, action="store_true",
+                     help="Don't clean up after done")
 
     def set_stripnames(self, default=True):
         if default:
@@ -379,6 +393,12 @@ class OptionParser (OptionP):
         self.add_option("--rclip", default=rclip, type="int",
                 help="Pair ID is derived from rstrip N chars [default: %default]")
 
+    def set_chr(self, chr=",".join([str(x) for x in range(1, 23)] + ["X", "Y", "MT"])):
+        self.add_option("--chr", default=chr, help="Chromosomes to process")
+
+    def set_ref(self, ref="/mnt/ref"):
+        self.add_option("--ref", default=ref, help="Reference folder")
+
     def set_cutoff(self, cutoff=0):
         self.add_option("--cutoff", default=cutoff, type="int",
                 help="Distance to call valid links between mates")
@@ -409,7 +429,7 @@ class OptionParser (OptionP):
 
     def set_pairs(self):
         """
-        %prog pairs <blastfile|samfile|casfile|bedfile|posmapfile>
+        %prog pairs <blastfile|samfile|bedfile>
 
         Report how many paired ends mapped, avg distance between paired ends, etc.
         Paired reads must have the same prefix, use --rclip to remove trailing
@@ -462,7 +482,7 @@ class OptionParser (OptionP):
     def set_trinity_opts(self, gg=False):
         self.set_home("trinity")
         self.set_cpus()
-        self.set_params(dest="Trinity")
+        self.set_params(prog="Trinity")
         topts = OptionGroup(self, "General Trinity options")
         self.add_option_group(topts)
         topts.add_option("--max_memory", default="128G", type="str",
@@ -572,6 +592,11 @@ class OptionParser (OptionP):
                    "eddyyeh": "/home/shared/scripts/eddyyeh",
                    "fiona": "~/export/fiona-0.2.0-Linux-x86_64",
                    "fermi": "~/export/fermi",
+                   "lobstr": "/mnt/software/lobSTR",
+                   "shapeit": "/mnt/software/shapeit",
+                   "impute": "/mnt/software/impute",
+                   "beagle": "java -jar /mnt/software/beagle.14Jan16.841.jar",
+                   "minimac": "/mnt/software/Minimac3/bin",
                    }.get(prog, None)
         if default is None:  # Last attempt at guessing the path
             try:
@@ -584,7 +609,7 @@ class OptionParser (OptionP):
         self.add_option(tag, default=default, help=help)
 
     def set_aligner(self, aligner="bowtie"):
-        valid_aligners = ("clc", "bowtie", "bwa")
+        valid_aligners = ("bowtie", "bwa")
         self.add_option("--aligner", default=aligner, choices=valid_aligners,
                      help="Use aligner [default: %default]")
 
@@ -1298,12 +1323,16 @@ def send_email(fromaddr, toaddr, subject, message):
     Send an email message
     """
     from smtplib import SMTP
+    from email.mime.text import MIMEText
 
     SERVER = "localhost"
-    message = "Subject: {0}\n{1}".format(subject, message)
+    _message = MIMEText(message)
+    _message['Subject'] = subject
+    _message['From'] = fromaddr
+    _message['To'] = ", ".join(toaddr)
 
     server = SMTP(SERVER)
-    server.sendmail(fromaddr, toaddr, message)
+    server.sendmail(fromaddr, toaddr, _message.as_string())
     server.quit()
 
 
@@ -1399,10 +1428,11 @@ def notify(args):
     message = " ".join(args).strip()
 
     if opts.method == "email":
-        if not is_valid_email(opts.email):
-            logging.debug("Email address `{0}` is not valid!".format(opts.email))
-            sys.exit()
-        toaddr = [opts.email]   # TO address should be in a list
+        toaddr = opts.email.split(",")   # TO address should be in a list
+        for addr in toaddr:
+            if not is_valid_email(addr):
+                logging.debug("Email address `{0}` is not valid!".format(addr))
+                sys.exit()
         send_email(fromaddr, toaddr, subject, message)
     else:
         pushnotify(subject, message, api=opts.api, priority=opts.priority, \

@@ -385,9 +385,11 @@ def to_range(obj, score=None, id=None, strand=None):
 
     return (obj.seqid, obj.start, obj.end)
 
+
 def main():
 
     actions = (
+        ('addparent', 'merge sister features and infer their parent'),
         ('bed', 'parse gff and produce bed file for particular feature type'),
         ('bed12', 'produce bed12 file for coding features'),
         ('fromgtf', 'convert gtf to gff3 format'),
@@ -421,6 +423,56 @@ def main():
 
     p = ActionDispatcher(actions)
     p.dispatch(globals())
+
+
+def addparent(args):
+    """
+    %prog addparent file.gff
+
+    Merge sister features and infer parents.
+    """
+    p = OptionParser(addparent.__doc__)
+    p.add_option("--childfeat", default="CDS", help="Type of children feature")
+    p.add_option("--parentfeat", default="mRNA", help="Type of merged feature")
+    p.set_outfile()
+    opts, args = p.parse_args(args)
+
+    if len(args) != 1:
+        sys.exit(not p.print_help())
+
+    gff_file, = args
+    gff = Gff(gff_file)
+    data = defaultdict(list)
+    for g in gff:
+        if g.type != opts.childfeat:
+            continue
+        data[g.parent].append(g)
+
+    logging.debug("A total of {0} {1} features clustered".\
+                    format(len(data), opts.childfeat))
+
+    parents = []
+    for parent, dd in data.items():
+        d = dd[0]
+        start, end = min(x.start for x in dd), max(x.end for x in dd)
+        gffline = "\t".join(str(x) for x in \
+                        (d.seqid, d.source, opts.parentfeat, start, end,
+                         ".", d.strand, ".", "ID={0};Name={0}".format(parent)))
+        parents.append(GffLine(gffline))
+    parents.sort(key=lambda x: (x.seqid, x.start))
+    logging.debug("Merged feature sorted")
+
+    fw = must_open(opts.outfile, "w")
+    for parent in parents:
+        print >> fw, parent
+        parent_id = parent.id
+        for d in data[parent_id]:
+            if d.accn == parent_id:
+                new_id = "{0}.{1}1".format(parent_id, opts.childfeat)
+                d.set_attr("ID", new_id)
+                d.set_attr("Name", new_id, update=True)
+            print >> fw, d
+    fw.close()
 
 
 def _fasta_slice(fasta, seqid, start, stop, strand):
@@ -1300,6 +1352,8 @@ def format(args):
                 " accepts comma-separated list or list file [default: %default]")
     g3.add_option("--gsac", default=False, action="store_true",
                  help="Fix GSAC GFF3 file attributes [default: %default]")
+    g3.add_option("--invent_protein_feat", default=False, action="store_true",
+                 help="Invent a protein feature span (chain CDS feats)")
     g3.add_option("--process_ftype", default=None, type="str",
                  help="Specify feature types to process; "
                  "accepts comma-separated list of feature types [default: %default]")
@@ -1345,6 +1399,7 @@ def format(args):
     strict = False if opts.nostrict else True
     make_gff_store = True if gffile in ("-", "stdin") else opts.make_gff_store
     invent_name_attr = opts.invent_name_attr
+    invent_protein_feat = opts.invent_protein_feat
     compute_signature = False
 
     outfile = opts.outfile
@@ -1396,7 +1451,8 @@ def format(args):
 
     remove = set()
     if unique or duptype or remove_feats or remove_feats_by_ID \
-            or opts.multiparents == "merge" or invent_name_attr or make_gff_store:
+            or opts.multiparents == "merge" or invent_name_attr or make_gff_store \
+            or invent_protein_feat:
         if unique:
             dupcounts = defaultdict(int)
             seen = defaultdict(int)
@@ -1408,6 +1464,8 @@ def format(args):
             merge_feats = AutoVivification()
         if invent_name_attr:
             ft = GffFeatureTracker()
+        if invent_protein_feat:
+            cds_track = {}
         if opts.multiparents == "merge" or invent_name_attr:
             make_gff_store = compute_signature = True
         gff = Gff(gffile, keep_attr_order=(not opts.no_keep_attr_order), \
@@ -1440,6 +1498,12 @@ def format(args):
                 if not parent:
                     parent = g.get_attr("Parent")
                 ft.track(parent, g)
+            if invent_protein_feat:
+                if g.type == 'CDS':
+                    cds_parent = g.get_attr("Parent")
+                    if cds_parent not in cds_track:
+                        cds_track[cds_parent] = []
+                    cds_track[cds_parent].append((g.start, g.end))
 
     if opts.verifySO:
         so = load_GODag()
@@ -1584,6 +1648,19 @@ def format(args):
                     if opts.multiparents == "merge" and attr == "Name":
                         g.set_attr("ID", "{0}:{1}:{2}".format(parent, g.type, fidx + 1))
 
+        protein_feat = None
+        if invent_protein_feat:
+            if g.type == 'mRNA':
+                if id in cds_track:
+                    pstart, pstop = range_minmax(cds_track[id])
+                    protein_feat = GffLine("\t".join(str(x) for x in [g.seqid, g.source, "protein", pstart, pstop, \
+                            ".", g.strand, ".", "ID={0}-Protein;Name={0};Derives_from={0}".format(id)]))
+            elif g.type == 'CDS':
+                parent = g.get_attr("Parent")
+                if parent in cds_track:
+                    _parent = [parent, "{0}-Protein".format(parent)]
+                    g.set_attr("Parent", _parent)
+
         pp = g.get_attr("Parent", first=False)
         if opts.multiparents == "split" and (pp and len(pp) > 1) and g.type != "CDS":  # separate features with multiple parents
             id = g.get_attr("ID")
@@ -1602,6 +1679,8 @@ def format(args):
             if duptype == g.type and skip[(g.seqid, g.idx, id, g.start, g.end)] == 1:
                 continue
             print >> fw, g
+            if g.type == 'mRNA' and invent_protein_feat:
+                print >> fw, protein_feat
 
     fw.close()
 
@@ -2221,12 +2300,12 @@ def extract(args):
 
     contigID = parse_multi_values(contigfile)
     names = parse_multi_values(namesfile)
-    if names == None: names = list()
     types = parse_multi_values(typesfile)
     outfile = opts.outfile
 
     if opts.children:
-        assert types is not None or (len(names) > 0), "Must set --names or --types"
+        assert types is not None or names is not None, "Must set --names or --types"
+        if names == None: names = list()
         populate_children(outfile, names, gffile, iter=opts.children, types=types)
         return
 
@@ -2307,6 +2386,9 @@ def note(args):
             help="Only process certain types, multiple types allowed with comma")
     p.add_option("--attribute", default="Parent,Note",
             help="Attribute field to extract, multiple fields allowd with comma")
+    p.add_option("--AED", type="float", help="Only extract lines with AED score <=")
+    p.add_option("--exoncount", default=False, action="store_true",
+            help="Get the exon count for each mRNA feat")
     opts, args = p.parse_args(args)
 
     if len(args) != 1:
@@ -2316,15 +2398,33 @@ def note(args):
     type = opts.type
     if type:
         type = type.split(",")
+
+    g = make_index(gffile)
+    exoncounts = {}
+    if opts.exoncount:
+        for feat in g.features_of_type("mRNA"):
+            nexons = 0
+            for c in g.children(feat.id, 1):
+                if c.featuretype != "exon":
+                    continue
+                nexons += 1
+            exoncounts[feat.id] = nexons
+
     attrib = opts.attribute.split(",")
 
     gff = Gff(gffile)
     seen = set()
+    AED = opts.AED
     for g in gff:
         if type and g.type not in type:
             continue
+        if AED is not None and float(g.attributes["_AED"][0]) > AED:
+            continue
         keyval = [g.accn] + [",".join(g.attributes[x]) \
                             for x in attrib if x in g.attributes]
+        if exoncounts:
+            nexons = exoncounts.get(g.accn, 0)
+            keyval.append(str(nexons))
         keyval = tuple(keyval)
         if keyval not in seen:
             print "\t".join(keyval)
